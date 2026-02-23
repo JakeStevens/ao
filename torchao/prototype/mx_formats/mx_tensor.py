@@ -157,10 +157,16 @@ def to_mx(
     block_size: int,
     scaling_mode: ScaleCalculationMode = ScaleCalculationMode.FLOOR,
     is_swizzled_scales: bool = False,
+    scale_e8m0_biased: Optional[torch.Tensor] = None,
 ):
     """
     Takes a high precision tensor and converts to MX scale and raw data, in
     naive layout (scale and raw data are separate tensors).
+
+    If scale_e8m0_biased is provided, uses that precomputed e8m0 scale instead
+    of computing one from the data. This is useful for GPTQ which computes the
+    scale once per group and then quantizes each column individually with that
+    same scale.
     """
     assert data_hp.dtype in (
         torch.bfloat16,
@@ -178,26 +184,7 @@ def to_mx(
         *orig_shape[:-1], orig_shape[-1] // block_size, block_size
     )
 
-    # find max value of the data
-    # Note: this only implements the `minimally supported` version of
-    # https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
-    # section 6.3.
-    max_abs = torch.amax(torch.abs(data_hp), -1).unsqueeze(-1)
-
-    # We cast to float32 here because
-    # in the `max_abs_int32 = max_abs.view(hp_int_dtype)` line below,
-    # if tensor parallel is enabled then the resulting shape is 2x larger
-    # than it should be under some conditions, likely because of a bug in
-    # the `view` op with DTensor and target dtype int16.  I reproduce in
-    # torchtitan but not in a unit test, so not enough info to file a good
-    # issue in pytorch/pytorch. For now, work around. In the future we should
-    # debug and fix this properly.
-    data_hp = data_hp.to(torch.float32)
-    max_abs = max_abs.to(torch.float32)
-
-    # Set X to be the largest power-of-two less than or equal to
-    # max_abs(v), divided by the largest power of two representable
-    # in the element data type, and get the mbits at the same time
+    # Determine dtype-specific constants
     if elem_dtype == torch.float8_e4m3fn:
         target_max_pow2 = F8E4M3_MAX_POW2
         mbits = MBITS_F8_E4M3
@@ -221,95 +208,139 @@ def to_mx(
     else:
         raise AssertionError("unsupported element dtype")
 
-    if scaling_mode == ScaleCalculationMode.RCEIL:
-        scale_e8m0_biased, data_lp = _to_mx_rceil(data_hp, max_abs, max_pos)
-    else:
-        assert data_hp.dtype is torch.float32
-        hp_int_dtype = torch.int32
-        hp_mbits = MBITS_F32
-        hp_ebits = EBITS_F32
-        hp_exp_bias = F32_EXP_BIAS
-
-        # rounding before calculating the largest power of 2
-        # X = 2^(floor(log2(rounding(max_abs(v)))-max_exp))
-        if scaling_mode == ScaleCalculationMode.EVEN:
-            nan_mask = torch.isnan(max_abs)
-            max_abs = max_abs.view(hp_int_dtype)
-            val_to_add = 1 << (hp_mbits - mbits - 1)
-            mask = ((1 << (hp_ebits + SBITS)) - 1) << hp_mbits
-            max_abs = (max_abs + val_to_add) & mask
-            max_abs = max_abs.view(data_hp.dtype)
-            max_abs[nan_mask] = torch.tensor(
-                float("nan"), device=max_abs.device, dtype=max_abs.dtype
-            )
-
-        # Calculate the scale for different modes
-        max_abs_int32 = max_abs.view(hp_int_dtype)
-        # For now, use `torch.bitwise_right_shift` instead of `>>` to support DTensor
-        # See https://github.com/pytorch/pytorch/issues/156533.
-        extracted_pow2 = (
-            (torch.bitwise_right_shift(max_abs_int32, hp_mbits)) & 0b11111111
-        ) - hp_exp_bias
-
-        if scaling_mode in (ScaleCalculationMode.FLOOR, ScaleCalculationMode.EVEN):
-            scale_e8m0_unbiased = extracted_pow2 - target_max_pow2
-        elif scaling_mode == ScaleCalculationMode.CEIL:
-            # round up: add one to scale if the mantissa is larger than 0
-            # 0x7FFFFF is equal to 23 ones
-            mantissa_gt_one = (max_abs_int32 & 0x7FFFFF) > 0
-            extracted_pow2 += mantissa_gt_one
-            scale_e8m0_unbiased = extracted_pow2 - target_max_pow2
-        else:
-            raise AssertionError("unsupported scaling calculation mode")
-
-        # Clamp to exponents that can be represented in e8m0
-        # add one to positive range to capture NaNs
-        scale_e8m0_unbiased = torch.clamp(
-            scale_e8m0_unbiased, min=-E8M0_EXPONENT_BIAS, max=E8M0_EXPONENT_BIAS + 1
+    if scale_e8m0_biased is not None:
+        # Use precomputed scale -- skip scale derivation from data
+        assert scale_e8m0_biased.dtype == torch.float8_e8m0fnu, (
+            f"scale_e8m0_biased.dtype must be float8_e8m0fnu, "
+            f"got {scale_e8m0_biased.dtype}"
         )
 
-        # Create the biased e8m0 representation and cast it to 8 bits
-        scale_e8m0_biased = scale_e8m0_unbiased + E8M0_EXPONENT_BIAS
-        scale_e8m0_biased = scale_e8m0_biased.to(torch.uint8)
-
-        # Conversion to torch.uint8 sets NaN values to 0, fix this by
-        # explicitly setting known NaN values to 255
-        scale_e8m0_biased = torch.where(
-            torch.isnan(max_abs),
-            E8M0_EXPONENT_NAN_VAL,
-            scale_e8m0_biased,
-        )
-
-        # For now, calculate the scale in floating point.
-        # For now, use `torch.bitwise_left_shift` instead of `<<` to support DTensor
-        # See https://github.com/pytorch/pytorch/issues/156533.
         scale_fp32 = (
-            torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)
+            torch.bitwise_left_shift(
+                scale_e8m0_biased.view(torch.uint8).to(torch.int32),
+                MBITS_F32,
+            )
         ).view(torch.float32)
-
-        # Today, 2**-127 returns 0 in compile+inductor+triton because it is in the
-        # float32 denormal range. For now, manually adjust the fp scale. This is
-        # relevant if all of the incoming block values are zeroes.
-        # See https://github.com/pytorch/pytorch/issues/125557 for details.
-        # Note: it would be more correct to set the minimum to 2**-127, but this
-        # does not work in triton either as it looks like subnormal value handling
-        # has some gaps.  So, for now just set to the minimum normal value.
         scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
+        scale_fp32 = scale_fp32.unsqueeze(-1)
 
-        # scale and saturated cast the data elements to max of target dtype
         data_lp = data_hp / scale_fp32
 
         if (
             elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not torch._dynamo.is_compiling()
         ):
-            # As of 20250317, the Pytorch eager mode cast to `torch.float8_e4m3fn`
-            # is unsaturated. This cast is saturated in triton. If we are compute bound,
-            # we see a speedup if we remove this redundant clamp if we are compiling
-            # to triton.
-            # TODO(#1912): make the saturated cast work in eager mode and remove this
-            # workaround.
             data_lp = torch.clamp(data_lp, min=-1 * max_pos, max=max_pos)
+
+    else:
+        # Compute scale from data
+        # Note: this only implements the `minimally supported` version of
+        # https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
+        # section 6.3.
+        max_abs = torch.amax(torch.abs(data_hp), -1).unsqueeze(-1)
+
+        # We cast to float32 here because
+        # in the `max_abs_int32 = max_abs.view(hp_int_dtype)` line below,
+        # if tensor parallel is enabled then the resulting shape is 2x larger
+        # than it should be under some conditions, likely because of a bug in
+        # the `view` op with DTensor and target dtype int16.  I reproduce in
+        # torchtitan but not in a unit test, so not enough info to file a good
+        # issue in pytorch/pytorch. For now, work around. In the future we should
+        # debug and fix this properly.
+        data_hp = data_hp.to(torch.float32)
+        max_abs = max_abs.to(torch.float32)
+
+        if scaling_mode == ScaleCalculationMode.RCEIL:
+            scale_e8m0_biased, data_lp = _to_mx_rceil(data_hp, max_abs, max_pos)
+        else:
+            assert data_hp.dtype is torch.float32
+            hp_int_dtype = torch.int32
+            hp_mbits = MBITS_F32
+            hp_ebits = EBITS_F32
+            hp_exp_bias = F32_EXP_BIAS
+
+            # rounding before calculating the largest power of 2
+            # X = 2^(floor(log2(rounding(max_abs(v)))-max_exp))
+            if scaling_mode == ScaleCalculationMode.EVEN:
+                nan_mask = torch.isnan(max_abs)
+                max_abs = max_abs.view(hp_int_dtype)
+                val_to_add = 1 << (hp_mbits - mbits - 1)
+                mask = ((1 << (hp_ebits + SBITS)) - 1) << hp_mbits
+                max_abs = (max_abs + val_to_add) & mask
+                max_abs = max_abs.view(data_hp.dtype)
+                max_abs[nan_mask] = torch.tensor(
+                    float("nan"), device=max_abs.device, dtype=max_abs.dtype
+                )
+
+            # Calculate the scale for different modes
+            max_abs_int32 = max_abs.view(hp_int_dtype)
+            # For now, use `torch.bitwise_right_shift` instead of `>>` to support DTensor
+            # See https://github.com/pytorch/pytorch/issues/156533.
+            extracted_pow2 = (
+                (torch.bitwise_right_shift(max_abs_int32, hp_mbits)) & 0b11111111
+            ) - hp_exp_bias
+
+            if scaling_mode in (ScaleCalculationMode.FLOOR, ScaleCalculationMode.EVEN):
+                scale_e8m0_unbiased = extracted_pow2 - target_max_pow2
+            elif scaling_mode == ScaleCalculationMode.CEIL:
+                # round up: add one to scale if the mantissa is larger than 0
+                # 0x7FFFFF is equal to 23 ones
+                mantissa_gt_one = (max_abs_int32 & 0x7FFFFF) > 0
+                extracted_pow2 += mantissa_gt_one
+                scale_e8m0_unbiased = extracted_pow2 - target_max_pow2
+            else:
+                raise AssertionError("unsupported scaling calculation mode")
+
+            # Clamp to exponents that can be represented in e8m0
+            # add one to positive range to capture NaNs
+            scale_e8m0_unbiased = torch.clamp(
+                scale_e8m0_unbiased,
+                min=-E8M0_EXPONENT_BIAS,
+                max=E8M0_EXPONENT_BIAS + 1,
+            )
+
+            # Create the biased e8m0 representation and cast it to 8 bits
+            scale_e8m0_biased = scale_e8m0_unbiased + E8M0_EXPONENT_BIAS
+            scale_e8m0_biased = scale_e8m0_biased.to(torch.uint8)
+
+            # Conversion to torch.uint8 sets NaN values to 0, fix this by
+            # explicitly setting known NaN values to 255
+            scale_e8m0_biased = torch.where(
+                torch.isnan(max_abs),
+                E8M0_EXPONENT_NAN_VAL,
+                scale_e8m0_biased,
+            )
+
+            # For now, calculate the scale in floating point.
+            # For now, use `torch.bitwise_left_shift` instead of `<<` to support DTensor
+            # See https://github.com/pytorch/pytorch/issues/156533.
+            scale_fp32 = (
+                torch.bitwise_left_shift(scale_e8m0_biased.to(torch.int32), MBITS_F32)
+            ).view(torch.float32)
+
+            # Today, 2**-127 returns 0 in compile+inductor+triton because it is in the
+            # float32 denormal range. For now, manually adjust the fp scale. This is
+            # relevant if all of the incoming block values are zeroes.
+            # See https://github.com/pytorch/pytorch/issues/125557 for details.
+            # Note: it would be more correct to set the minimum to 2**-127, but this
+            # does not work in triton either as it looks like subnormal value handling
+            # has some gaps.  So, for now just set to the minimum normal value.
+            scale_fp32 = torch.clamp(scale_fp32, min=F32_MIN_NORMAL)
+
+            # scale and saturated cast the data elements to max of target dtype
+            data_lp = data_hp / scale_fp32
+
+            if (
+                elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and not torch._dynamo.is_compiling()
+            ):
+                # As of 20250317, the Pytorch eager mode cast to `torch.float8_e4m3fn`
+                # is unsaturated. This cast is saturated in triton. If we are compute bound,
+                # we see a speedup if we remove this redundant clamp if we are compiling
+                # to triton.
+                # TODO(#1912): make the saturated cast work in eager mode and remove this
+                # workaround.
+                data_lp = torch.clamp(data_lp, min=-1 * max_pos, max=max_pos)
 
     # cast to target dtype
     if elem_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
@@ -551,6 +582,7 @@ class MXTensor(TorchAOBaseTensor):
         act_quant_kwargs: Optional[QuantizeTensorToMXKwargs] = None,
         is_swizzled_scales: bool = False,
         mxfp8_dim0_cast_kernel_choice: MXFP8Dim0CastKernelChoice = MXFP8Dim0CastKernelChoice.TORCH,
+        scale: Optional[torch.Tensor] = None,
     ):
         assert mxfp8_dim0_cast_kernel_choice in (
             MXFP8Dim0CastKernelChoice.TRITON,
@@ -559,22 +591,32 @@ class MXTensor(TorchAOBaseTensor):
             f"unsupported kernel choice for mxfp8_dim0_cast_kernel_choice: {mxfp8_dim0_cast_kernel_choice}"
         )
 
-        triton_kernel_supported = (
-            elem_dtype == torch.float8_e4m3fn and not is_swizzled_scales
-        )
-        if mxfp8_dim0_cast_kernel_choice == MXFP8Dim0CastKernelChoice.TRITON:
-            assert triton_kernel_supported, (
-                f"triton kernel unsupported for {data_hp.dtype=}, {elem_dtype=}, {scaling_mode=}, {is_swizzled_scales=}"
+        if scale is None:
+            triton_kernel_supported = (
+                elem_dtype == torch.float8_e4m3fn and not is_swizzled_scales
             )
-            data_lp, scale_e8m0_biased = triton_to_mxfp8_dim0(
-                data_hp,
-                inner_block_size=block_size,
-                scaling_mode=scaling_mode.value,
-            )
+            if mxfp8_dim0_cast_kernel_choice == MXFP8Dim0CastKernelChoice.TRITON:
+                assert triton_kernel_supported, (
+                    f"triton kernel unsupported for {data_hp.dtype=}, {elem_dtype=}, {scaling_mode=}, {is_swizzled_scales=}"
+                )
+                data_lp, scale_e8m0_biased = triton_to_mxfp8_dim0(
+                    data_hp,
+                    inner_block_size=block_size,
+                    scaling_mode=scaling_mode.value,
+                )
+            else:
+                scale_e8m0_biased, data_lp = to_mx(
+                    data_hp, elem_dtype, block_size, scaling_mode, is_swizzled_scales
+                )
         else:
             scale_e8m0_biased, data_lp = to_mx(
-                data_hp, elem_dtype, block_size, scaling_mode, is_swizzled_scales
+                data_hp,
+                elem_dtype,
+                block_size,
+                is_swizzled_scales=is_swizzled_scales,
+                scale_e8m0_biased=scale,
             )
+
         if isinstance(scale_e8m0_biased, DTensor):
             assert isinstance(data_lp, DTensor), "unsupported"
             local_scale_e8m0_biased = scale_e8m0_biased.to_local()
