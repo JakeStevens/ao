@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
+import torch
 import triton
 import triton.language as tl
 from triton import Config
@@ -152,15 +153,19 @@ def init_to_zero(name):
 
 MIXED_MM_HEURISTICS = {
     "EVEN_K": lambda args: args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0,
-    "BLOCK_K": lambda args: min(args["BLOCK_K"], args["QGROUP_SIZE"])
-    if not args["TRANSPOSED"]
-    else args["BLOCK_K"],
-    "BLOCK_N": lambda args: min(args["BLOCK_N"], args["QGROUP_SIZE"])
-    if args["TRANSPOSED"]
-    else args["BLOCK_N"],
-    "SPLIT_K": lambda args: 1
-    if args["IS_BFLOAT16"]
-    else args["SPLIT_K"],  # atomic add not supported for bfloat16
+    "BLOCK_K": lambda args: (
+        min(args["BLOCK_K"], args["QGROUP_SIZE"])
+        if not args["TRANSPOSED"]
+        else args["BLOCK_K"]
+    ),
+    "BLOCK_N": lambda args: (
+        min(args["BLOCK_N"], args["QGROUP_SIZE"])
+        if args["TRANSPOSED"]
+        else args["BLOCK_N"]
+    ),
+    "SPLIT_K": lambda args: (
+        1 if args["IS_BFLOAT16"] else args["SPLIT_K"]
+    ),  # atomic add not supported for bfloat16
 }
 
 
@@ -389,7 +394,11 @@ def _mixed_mm_kernel(
     if SPLIT_K == 1:
         tl.store(C, acc, mask=mask)
     else:
-        tl.atomic_add(C, acc, mask=mask)
+        # AMD GPUs need relaxed semantics for better performance
+        if tl.constexpr(torch.version.hip is not None):
+            tl.atomic_add(C, acc, mask=mask, sem="relaxed")
+        else:
+            tl.atomic_add(C, acc, mask=mask)
 
 
 _mixed_mm = triton.heuristics(MIXED_MM_HEURISTICS)(_mixed_mm_kernel)
